@@ -154,9 +154,9 @@ if __name__ == "__main__":
         "reuse_cached": True
     }
     match_files = run_match(
-        molecule_dirs=[r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au/NHC_left/', r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au/NHC_right/'],
-        metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au/lone_adatom',
-        full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au/NHC2Au_complex',
+        molecule_dirs=[r'dirs'],
+        metal_dir=r'dir',
+        full_dir=r'dir',
         **run_kwargs
     )
     main_match_file = match_files[0]
@@ -175,4 +175,5 @@ if __name__ == "__main__":
         plt.show()
         print(f"[MAIN] Generated and displayed color plot from '{main_match_file}'")
     except Exception as e:
+
         print(f"[WARN] Plotter call failed: {e}")
