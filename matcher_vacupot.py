@@ -1,22 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 File: matcher_vacupot.py (Merged: Vacuum Alignment + Builder + Classifier Analysis)
+Supports multiple molecule systems simultaneously.
+Allows choosing the Global Zero reference system.
+Uses WF_dpl_vcupot for vacuum calculation.
 """
 import os
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from pymatgen.io.vasp import Locpot
 import matplotlib.pyplot as plt
 
 # --- 1. Import all external tools properly ---
 from builder import TrueBlochStateBuilder
-from plotter_layered_vaccupot import RectAEPAWColorPlotter, PlotConfig
+from plotter_layered_vacupot import RectAEPAWColorPlotter, PlotConfig
 from classifier import StateBehaviorClassifier 
+
+# IMPORT THE VACUUM LOGIC
+from WF_dpl_vacupot import calculate_work_function
 
 class RectangularTrueBlochMatcher:
     """
     Analyzes overlaps between pre-computed true Bloch states. 
     Performs vacuum-level alignment for physical energy consistency.
+    Supports multiple molecule inputs.
     """
     def __init__(self, molecule_dirs, metal_dir, full_dir, **kwargs):
         self.molecule_dirs = list(molecule_dirs)
@@ -28,114 +35,67 @@ class RectangularTrueBlochMatcher:
         self.curv_tol = kwargs.get("curvature_tol", 2.5e-5)
         self.dipole_threshold = kwargs.get("dipole_threshold", 2.5)
         
-        self.band_windows = {lbl: kwargs.get("band_window_molecules", [None]*len(self.molecule_dirs))[i] 
-                             for i, lbl in enumerate(self.mol_labels)}
-        self.band_windows.update({"metal": kwargs.get("band_window_metal"), 
-                                  "full": kwargs.get("band_window_full")})
+        # --- Robust Band Window Handling ---
+        bw_mols_input = kwargs.get("band_window_molecules", [None])
+        if not isinstance(bw_mols_input, list):
+            bw_mols_input = [bw_mols_input]
+        if len(bw_mols_input) < len(self.molecule_dirs):
+            diff = len(self.molecule_dirs) - len(bw_mols_input)
+            bw_mols_input.extend([bw_mols_input[-1]] * diff)
+            
+        self.band_windows = {lbl: bw_mols_input[i] for i, lbl in enumerate(self.mol_labels)}
+        self.band_windows.update({
+            "metal": kwargs.get("band_window_metal"), 
+            "full": kwargs.get("band_window_full")
+        })
 
     @staticmethod
-    def get_vacuum_potential(directory: str, curvature_tol=2.5e-5, dipole_threshold=2.5, reuse_cache=True) -> Tuple[float, bool]:
+    def get_vacuum_potential(directory: str, curvature_tol=5e-8, dipole_threshold=0.15, min_width=10, reuse_cache=True) -> Tuple[float, bool]:
         """
-        Calculates the vacuum potential from LOCPOT. 
-        Caches the result in 'vacuum_potential.npz' in the same directory.
-        
-        Returns:
-            Tuple[float, bool]: (vacuum_potential, is_from_cache)
+        Uses WF_dpl_vcupot logic to find vacuum potential. 
         """
         cache_path = os.path.join(directory, "vacuum_potential.npz")
         
-        # --- Check Cache ---
+        # 1. Check Cache
         if reuse_cache and os.path.isfile(cache_path):
             try:
                 data = np.load(cache_path)
-                v_vac = float(data["v_vac"])
-                # Print statements removed here; returned as status bool instead
-                return v_vac, True
+                return float(data["v_vac"]), True
             except Exception:
-                # Silently fail on cache load and proceed to calculation
                 pass
 
-        # --- Calculation Logic ---
         locpot_path = os.path.join(directory, "LOCPOT")
         if not os.path.exists(locpot_path):
             raise FileNotFoundError(f"LOCPOT missing in {directory} for vacuum alignment.")
         
-        locpot = Locpot.from_file(locpot_path)
-        potential_data = locpot.data['total']
-        z_potential = np.mean(np.mean(potential_data, axis=0), axis=0)
-        nz = z_potential.shape[0]
-        
-        z_padded = np.pad(z_potential, (2, 2), mode='wrap')
-        slopes_padded = np.gradient(z_padded)
-        curvatures_padded = np.abs(np.gradient(slopes_padded))
-        curvatures = curvatures_padded[2:-2]
-        
-        stable_indices = np.where(curvatures < curvature_tol)[0]
-        
-        vacuum_potential = 0.0
-        
-        if stable_indices.size == 0:
-            print(f"  [WARN] No stable vacuum found in {os.path.basename(directory)}. Defaulting to max potential.")
-            vacuum_potential = np.max(z_potential)
-        else:
-            linear_regions = []
-            if stable_indices.size > 0:
-                start = stable_indices[0]
-                for i in range(1, len(stable_indices)):
-                    if stable_indices[i] != stable_indices[i - 1] + 1:
-                        end = stable_indices[i - 1] + 1
-                        linear_regions.append({
-                            'start': start, 'end': end, 'width': end - start, 
-                            'avg_v': np.mean(z_potential[start:end]), 'is_wrapped': False
-                        })
-                        start = stable_indices[i]
-                end = stable_indices[-1] + 1
-                linear_regions.append({
-                    'start': start, 'end': end, 'width': end - start, 
-                    'avg_v': np.mean(z_potential[start:end]), 'is_wrapped': False
-                })
+        # 2. Load LOCPOT
+        try:
+            locpot = Locpot.from_file(locpot_path)
+        except Exception as e:
+             print(f"  [ERROR] Failed to load LOCPOT at {directory}: {e}")
+             return 0.0, False
 
-            regions = []
-            if len(linear_regions) > 1:
-                first_r, last_r = linear_regions[0], linear_regions[-1]
-                if first_r['start'] == 0 and last_r['end'] == nz:
-                    total_points = first_r['width'] + last_r['width']
-                    weighted_v = (first_r['avg_v'] * first_r['width'] + last_r['avg_v'] * last_r['width']) / total_points
-                    wrapped_region = {
-                        'start': None, 'end': None, 'width': total_points,
-                        'avg_v': weighted_v, 'is_wrapped': True, 'segments': [last_r, first_r]
-                    }
-                    regions = [wrapped_region] + linear_regions[1:-1]
-                else:
-                    regions = linear_regions
-            else:
-                regions = linear_regions
+        # 3. Call External Logic
+        # We pass ef=0.0 because we only care about the absolute vacuum potential (v_vac)
+        # returned in the tuple, not the work function derived from EF.
+        try:
+            _, v_vac, _ = calculate_work_function(
+                locpot, 
+                ef=0.0, 
+                curvature_tol=curvature_tol, 
+                dipole_threshold=dipole_threshold, 
+                min_width=min_width,
+                plot=False,     # Disable plotting for batch mode
+                verbose=False   # Disable verbose printing
+            )
+        except Exception as e:
+            print(f"  [ERROR] Vacuum calculation failed for {os.path.basename(directory)}: {e}")
+            # Fallback to simple max if complex logic fails
+            v_vac = np.max(locpot.data['total'])
 
-            potentials = [r['avg_v'] for r in regions]
-            potential_spread = max(potentials) - min(potentials)
-            dipole_detected = potential_spread > dipole_threshold
-            
-            if dipole_detected:
-                best_region = max(regions, key=lambda x: x['avg_v'])
-                mode_str = "Dipole (Highest V)"
-            else:
-                best_region = max(regions, key=lambda x: x['width'])
-                mode_str = "Standard (Widest)"
-
-            if best_region['is_wrapped']:
-                seg1, seg2 = best_region['segments']
-                chunk1 = potential_data[:, :, seg1['start']:seg1['end']]
-                chunk2 = potential_data[:, :, seg2['start']:seg2['end']]
-                vacuum_potential = (np.sum(chunk1) + np.sum(chunk2)) / (chunk1.size + chunk2.size)
-            else:
-                v_start, v_end = best_region['start'], best_region['end']
-                vacuum_potential = np.mean(potential_data[:, :, v_start:v_end])
-
-            print(f"    -> Vac Mode: {mode_str:<18} | Spread: {potential_spread:.3f}eV | Level: {vacuum_potential:.4f}eV")
-
-        # --- Save Cache ---
-        np.savez(cache_path, v_vac=vacuum_potential)
-        return vacuum_potential, False
+        # 4. Save and Return
+        np.savez(cache_path, v_vac=v_vac)
+        return float(v_vac), False
 
     @staticmethod
     def load_true_bloch(directory):
@@ -162,14 +122,23 @@ class RectangularTrueBlochMatcher:
                 E[0, ib] = float(lines[line_index].split()[1])
         return E
 
-    def run(self, output_path: Optional[str] = None, reuse_vac_cache: bool = True):
+    def run(self, output_path: Optional[str] = None, reuse_vac_cache: bool = True, zero_reference: str = "metal"):
+        """
+        zero_reference: "metal", "full", or the name of a molecule (e.g. "NHC_left")
+        """
         dir_map = {label: path for label, path in zip(self.mol_labels, self.molecule_dirs)}
         dir_map["metal"], dir_map["full"] = self.metal_dir, self.full_dir
 
-        # --- 1. Builder Integration ---
+        # Validate reference input
+        valid_refs = ["metal", "full"] + self.mol_labels
+        if zero_reference not in valid_refs:
+             print(f"[ERROR] Invalid zero_reference '{zero_reference}'. Valid options: {valid_refs}. Defaulting to 'metal'.")
+             zero_reference = "metal"
+
+        # 1. Builder
         psi_arrays_full = {name: self.load_true_bloch(path) for name, path in dir_map.items()}
         if not self.analysis_kwargs.get("reuse_cached", False) or any(psi is None for psi in psi_arrays_full.values()):
-            print("[MATCHER] Cached .npz files missing or reuse_cached=False. Invoking TrueBlochStateBuilder...")
+            print("[MATCHER] Building missing .npz files...")
             builder = TrueBlochStateBuilder(self.molecule_dirs, self.metal_dir, self.full_dir, **self.analysis_kwargs)
             builder.build_all()
             psi_arrays_full = {name: self.load_true_bloch(path) for name, path in dir_map.items()}
@@ -177,74 +146,75 @@ class RectangularTrueBlochMatcher:
         if any(psi is None for psi in psi_arrays_full.values()):
             raise FileNotFoundError("One or more required true_blochstates.npz files could not be loaded.")
 
-        # --- 2. Vacuum & Fermi Detection (ANCHOR: METAL SYSTEM) ---
-        print("\n[ALIGN] Detecting vacuum and Fermi levels (Reference: Metal System)...")
+        # 2. Vacuum & Fermi Detection
+        print(f"\n[ALIGN] Aligning Vacuum Levels (Ref: Metal) & Setting Global Zero (Ref: {zero_reference})...")
         
-        # A. Analyze Metal (The Anchor)
-        print("  [METAL] Analyzing vacuum (Anchor)...")
+        # A. Get Anchors (Metal Vacuum & Reference Fermi)
+        # Always align vacuums to metal first to establish physical frame
         v_vac_metal, cached_m = self.get_vacuum_potential(self.metal_dir, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
         
-        if cached_m:
-            print(f"    [CACHE] Loaded vacuum potential from {os.path.basename(self.metal_dir)}/vacuum_potential.npz: {v_vac_metal:.4f} eV")
-        else:
-            print("    [CALC] Calculating vacuum potential from LOCPOT...")
-            
+        # Calculate the Global Shift required to zero the requested reference
+        ref_path = dir_map[zero_reference]
+        v_vac_ref, _ = self.get_vacuum_potential(ref_path, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
+        e_fermi_ref_raw = self.read_fermi_from_doscar(ref_path)
+        
+        # Logic: 
+        # 1. Align Ref to Metal Vacuum:  E_ref_vac_aligned = E_ref_raw + (V_vac_metal - V_vac_ref)
+        # 2. We want E_ref_vac_aligned @ Fermi + global_shift = 0.0
+        # 3. Thus: global_shift = -(E_ref_raw + V_vac_metal - V_vac_ref)
+        
+        global_shift = -(e_fermi_ref_raw + (v_vac_metal - v_vac_ref))
+        print(f"  [ALIGN] Global Shift calculated: {global_shift:+.4f} eV (Ensures {zero_reference} E_f -> 0.0 eV)")
+
+        final_fermis = {}
+        homo_indices = {}
+
+        # B. Apply to Metal
         e_f_metal_raw = self.read_fermi_from_doscar(self.metal_dir)
         e_raw_metal = self.read_gamma_energies_from_eigenval(self.metal_dir)
         
-        global_shift = -e_f_metal_raw
+        # Shift = (Vac_Metal - Vac_Metal) + global_shift = global_shift
         shift_metal = global_shift 
         e_m_full = e_raw_metal + shift_metal
+        final_fermis["metal"] = e_f_metal_raw + shift_metal
         
         occ_m = np.where(e_raw_metal[0] < e_f_metal_raw)[0]
         homo_idx_m = occ_m[-1] + 1 if occ_m.size > 0 else 0
-        print(f"  [METAL]  Total Shift: {shift_metal:+.4f} eV | HOMO: Band {homo_idx_m} (Set to 0.0 eV)")
+        homo_indices["metal"] = homo_idx_m
+        print(f"  [METAL] V_vac={v_vac_metal:.4f} | Shift={shift_metal:+.4f} eV | Final Fermi={final_fermis['metal']:+.4f} eV")
 
-        # B. Analyze Full System
-        print("  [FULL] Analyzing vacuum...")
+        # C. Apply to Full System
         v_vac_full, cached_f = self.get_vacuum_potential(self.full_dir, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
-        
-        if cached_f:
-             print(f"    [CACHE] Loaded vacuum potential from {os.path.basename(self.full_dir)}/vacuum_potential.npz: {v_vac_full:.4f} eV")
-        else:
-             print("    [CALC] Calculating vacuum potential from LOCPOT...")
-
         e_f_full_raw = self.read_fermi_from_doscar(self.full_dir)
         
         shift_full = (v_vac_metal - v_vac_full) + global_shift
         e_f_full = self.read_gamma_energies_from_eigenval(self.full_dir) + shift_full
-        
-        e_f_full_final = e_f_full_raw + shift_full
-        print(f"  [FULL]   Total Shift: {shift_full:+.4f} eV | Final Fermi: {e_f_full_final:+.4f} eV (Delta Phi)")
+        final_fermis["full"] = e_f_full_raw + shift_full
+        print(f"  [FULL]  V_vac={v_vac_full:.4f} | Shift={shift_full:+.4f} eV | Final Fermi={final_fermis['full']:+.4f} eV")
 
-        # C. Analyze Molecule Systems
+        # D. Apply to Molecules
         e_ms_full = []
-        homo_indices = {"metal": homo_idx_m} # Store calculated HOMOs here
         
         for i, md in enumerate(self.molecule_dirs):
             label = self.mol_labels[i]
-            print(f"  [{label: <7}] Analyzing vacuum...")
             v_vac_mol, cached_mol = self.get_vacuum_potential(md, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
-            
-            if cached_mol:
-                print(f"    [CACHE] Loaded vacuum potential from {os.path.basename(md)}/vacuum_potential.npz: {v_vac_mol:.4f} eV")
-            else:
-                print("    [CALC] Calculating vacuum potential from LOCPOT...")
 
             e_f_mol_raw = self.read_fermi_from_doscar(md)
             e_raw_mol = self.read_gamma_energies_from_eigenval(md)
             
             occ_mol = np.where(e_raw_mol[0] < e_f_mol_raw)[0]
             homo_idx_mol = occ_mol[-1] + 1 if occ_mol.size > 0 else 0
-            homo_indices[label] = homo_idx_mol # Store it
+            homo_indices[label] = homo_idx_mol 
             
             shift_mol = (v_vac_metal - v_vac_mol) + global_shift
             e_ms_full.append(e_raw_mol + shift_mol)
-            print(f"  [{label: <7}] Total Shift: {shift_mol:+.4f} eV | HOMO: Band {homo_idx_mol}")
+            
+            final_fermis[label] = e_f_mol_raw + shift_mol
+            print(f"  [{label}] V_vac={v_vac_mol:.4f} | Shift={shift_mol:+.4f} eV | Final Fermi={final_fermis[label]:+.4f} eV")
         
-        print("[ALIGN] Alignment process complete.\n")
+        print("[ALIGN] Alignment complete.\n")
 
-        # --- 3. Band Window Slicing ---
+        # 3. Slicing
         bw_f = self.band_windows.get("full")
         psi_f = psi_arrays_full["full"][bw_f, :] if bw_f else psi_arrays_full["full"]
         e_f = e_f_full[:, bw_f] if bw_f else e_f_full
@@ -259,9 +229,8 @@ class RectangularTrueBlochMatcher:
             psi_molecules.append(psi_arrays_full[lbl][bw_mol, :] if bw_mol else psi_arrays_full[lbl])
             e_ms.append(e_ms_full[i][:, bw_mol] if bw_mol else e_ms_full[i])
 
-        # --- 4. CLASSIFIER ANALYSIS ---
+        # 4. Classifier
         S_mf = psi_m @ psi_f.conj().T
-        print("[CLASSIFIER] Running post-alignment interface analysis...")
         classifier = StateBehaviorClassifier()
         E_metal_min = np.min(e_m[0])
         degenerate_indices = np.where(e_m[0] < E_metal_min + 0.05)[0]
@@ -274,12 +243,9 @@ class RectangularTrueBlochMatcher:
         
         if group_recs:
             classification_info = classifier.classify_state(group_recs)
-            print(f"  -> Metal State Variance: {classification_info['variance']:.4f} eV^2")
-        else:
-             print("  -> No significant overlaps found for low-energy metal states.")
-        print("")
+            print(f"[CLASSIFIER] Metal State Variance: {classification_info['variance']:.4f} eV^2")
 
-        # --- 5. Final Overlap Calculation & Write ---
+        # 5. Overlaps & Write
         S_components = [psi @ psi_f.conj().T for psi in psi_molecules] + [S_mf]
         comp_labels = self.mol_labels + ["metal"]
         rows, ov_all_lines = [], []
@@ -292,9 +258,7 @@ class RectangularTrueBlochMatcher:
                 mags = np.abs(S[:, j])**2
                 i_best, ov_best, w_span = np.argmax(mags), mags.max(), mags.sum()
                 E_comp = energies[i_best]
-                # Adjust index output to be 1-based absolute index, handling windows if necessary
-                # Note: This logic assumes i_best is relative to the window. 
-                # Ideally, we'd map back to absolute, but for now we keep 1-based relative.
+                
                 bests[label] = dict(idx=i_best + 1, E=E_comp, dE=E_full-E_comp, ov_best=ov_best, w_span=w_span)
                 for i_pair, z in enumerate(S[:, j]):
                     ov_all_lines.append((label, j+1, i_pair+1, energies[i_pair], E_full - energies[i_pair], np.abs(z)**2, w_span))
@@ -305,9 +269,10 @@ class RectangularTrueBlochMatcher:
         os.makedirs(os.path.dirname(main_out), exist_ok=True)
         
         with open(main_out, "w") as f:
-            # === UPDATED: Write HOMO info to header ===
             homo_str = "; ".join([f"{k}={v}" for k, v in homo_indices.items()])
+            fermi_str = "; ".join([f"{k}={v:.5f}" for k, v in final_fermis.items()])
             f.write(f"# HOMOS: {homo_str}\n")
+            f.write(f"# FERMIS: {fermi_str}\n")
             f.write("# full_idx E_full " + " ".join([f"| {lbl}_idx {lbl}_E {lbl}_dE {lbl}_ov_best {lbl}_w_span" for lbl in comp_labels]) + " | residual\n")
             for r in sorted(rows, key=lambda x: x['full_idx']):
                 f.write(f"{r['full_idx']:<8d} {r['E_full']:.4f} " + " ".join([f"| {b['idx']:<7d} {b['E']:.4f} {b['dE']:.4f} {b['ov_best']:.5f} {b['w_span']:.5f}" for b in [r[lbl] for lbl in comp_labels]]) + f" | {r['residual']:.5f}\n")
@@ -320,11 +285,12 @@ class RectangularTrueBlochMatcher:
 
 def run_match(molecule_dirs, metal_dir, full_dir, **kwargs) -> List[str]:
     matcher = RectangularTrueBlochMatcher(molecule_dirs, metal_dir, full_dir, **kwargs)
-    
-    # Extract the reuse_vac_cache arg from kwargs (defaulting to True if not present)
     reuse_vac_cache = kwargs.get("reuse_vac_cache", True)
     
-    matcher.run(kwargs.get("output_path"), reuse_vac_cache=reuse_vac_cache)
+    # Pass 'zero_reference' from kwargs, defaulting to 'metal'
+    zero_reference = kwargs.get("zero_reference", "metal")
+    
+    matcher.run(kwargs.get("output_path"), reuse_vac_cache=reuse_vac_cache, zero_reference=zero_reference)
     main_file = kwargs.get("output_path") or os.path.join(full_dir, "band_matches_rectangular.txt")
     all_file = os.path.join(full_dir, "band_matches_rectangular_all.txt")
     return [main_file, all_file]
@@ -335,15 +301,19 @@ if __name__ == "__main__":
         "tol_map": 1e-3, 
         "check_species": True,
         "band_window_molecules": [slice(0, 42)],
-        "reuse_cached": True,       # Controls wavefunction caching (builder.py)
-        "reuse_vac_cache": True,    # Controls vacuum potential caching (matcher.py)
-        "curvature_tol": 2.5e-5, 
-        "dipole_threshold": 2.5 
+        "reuse_cached": True,       
+        "reuse_vac_cache": False,    
+        "curvature_tol": 5e-8, 
+        "dipole_threshold": 0.15,
+        
+        # === CHOOSE YOUR ZERO HERE ===
+        "zero_reference": "metal" # Options: "metal", "full", "NHC_left" (or your molecule folder name)
     }
+    
     match_files = run_match(
-        molecule_dirs=[r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/NHC/kp552'],
-        metal_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/adatom_surface/kpoints552',
-        full_dir=r'C:/Users/Benjamin Kafin/Documents/VASP/lone/fcc/kp552',
+        molecule_dirs=[r'/dir'],
+        metal_dir=r'/dir',
+        full_dir=r'/dir',
         **run_kwargs
     )
     main_match_file = match_files[0]
@@ -354,8 +324,6 @@ if __name__ == "__main__":
         cfg = PlotConfig(
             cmap_name_simple="managua_r", 
             cmap_name_metal="vanimo_r",
-            power_simple_neg=0.25, 
-            power_simple_pos=0.75,
             energy_range=(-20.0, 7.25), 
             shared_molecule_color=True,
             min_total_mol_wspan=0.02,
@@ -364,6 +332,5 @@ if __name__ == "__main__":
         plotter = RectAEPAWColorPlotter(cfg)
         fig, axes = plotter.plot(main_match_file, bonding=True)
         plt.show()
-        print(f"[MAIN] Generated and displayed color plot from '{main_match_file}'")
     except Exception as e:
         print(f"[WARN] Plotter call failed: {e}")
