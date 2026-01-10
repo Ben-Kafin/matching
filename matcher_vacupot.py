@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 # --- 1. Import all external tools properly ---
 from builder import TrueBlochStateBuilder
-from plotter_layered_vacupot import RectAEPAWColorPlotter, PlotConfig
+from vacupot_plotter import RectAEPAWColorPlotter, PlotConfig
 from classifier import StateBehaviorClassifier 
 
 # IMPORT THE VACUUM LOGIC
@@ -301,8 +301,8 @@ if __name__ == "__main__":
         "tol_map": 1e-3, 
         "check_species": True,
         "band_window_molecules": [slice(0, 42)],
-        "reuse_cached": True,       
-        "reuse_vac_cache": False,    
+        "reuse_cached": False,       
+        "reuse_vac_cache": True,    
         "curvature_tol": 5e-8, 
         "dipole_threshold": 0.15,
         
@@ -311,9 +311,9 @@ if __name__ == "__main__":
     }
     
     match_files = run_match(
-        molecule_dirs=[r'/dir'],
-        metal_dir=r'/dir',
-        full_dir=r'/dir',
+        molecule_dirs=[r'dir'],
+        metal_dir=r'dir',
+        full_dir=r'dir',
         **run_kwargs
     )
     main_match_file = match_files[0]
@@ -325,12 +325,27 @@ if __name__ == "__main__":
             cmap_name_simple="managua_r", 
             cmap_name_metal="vanimo_r",
             energy_range=(-20.0, 7.25), 
-            shared_molecule_color=True,
-            min_total_mol_wspan=0.02,
-            pick_primary=False,
+            shared_molecule_color=False,
+            min_total_mol_wspan=0.025, # Adjusted threshold for metal vs molecule
+            
+            # === NEW COLORING PARAMETERS ===
+            # Power-law warping for higher contrast near Fermi level
+            power_simple_neg=0.25,
+            power_simple_pos=0.75,
+            power_metal_neg=0.075,
+            power_metal_pos=0.075,
+            
+            # === CHOOSE YOUR COLORING MODE ===
+            # Options: "blended" (weighted mix), True (Winner-takes-all), False (Segmented)
+            pick_primary=False, 
+            
+            # === FERMI VISUALS ===
+            show_local_fermi=True, # Shows the red dashed lines for individual systems
         )
+        
         plotter = RectAEPAWColorPlotter(cfg)
-        fig, axes = plotter.plot(main_match_file, bonding=True)
+        # The 'bonding' flag controls tooltip behavior and zero-cross clamping
+        fig, axes = plotter.plot(main_match_file, bonding=True) 
         plt.show()
     except Exception as e:
         print(f"[WARN] Plotter call failed: {e}")
