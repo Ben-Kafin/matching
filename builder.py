@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Oct  8 21:18:18 2025
+Created on Wed Oct 8 21:18:18 2025
 
 @author: Benjamin Kafin
 """
@@ -60,23 +60,27 @@ class TrueBlochStateBuilder:
 
         mol_Ts = [self.build_T_injection(full_system.ch_per_atom, s.ch_per_atom, m) for s, m in zip(mol_systems, mol_maps)]
         metal_T = self.build_T_injection(full_system.ch_per_atom, metal_system.ch_per_atom, metal_map)
-        full_T = identity(sum(full_system.ch_per_atom))
+        full_T = identity(sum(full_system.ch_per_atom), format="csr")
 
-        # Build whitener (W) from the full system
+        # Build whitener (W) from the full system [cite: 39]
         Q = 0.5 * (full_system.ae.get_qijs() + full_system.ae.get_qijs().getH())
         W, qinfo = self.build_whitener(Q)
         print(f"[BUILDER] Whitener built: rank={qinfo['rank']}")
 
-        # Prepare jobs for parallel processing
-        jobs = [(s, s.C_by_k[self.k_index], T, d) for s, T, d in zip(mol_systems, mol_Ts, self.molecule_dirs)]
-        jobs.append((metal_system, metal_system.C_by_k[self.k_index], metal_T, self.metal_dir))
-        jobs.append((full_system, full_system.C_by_k[self.k_index], full_T, self.full_dir))
+        # Sequential system processing to avoid thread-safety issues with vaspwfc objects [cite: 47]
+        all_work = [(mol_systems[i], mol_Ts[i], self.molecule_dirs[i]) for i in range(len(mol_systems))]
+        all_work.append((metal_system, metal_T, self.metal_dir))
+        all_work.append((full_system, full_T, self.full_dir))
         
-        print(f"[BUILDER] Fusing PW + AE states for {len(jobs)} systems in parallel...")
-        Parallel(n_jobs=len(jobs), prefer="threads")(delayed(self._process_and_save)(s, C, T, p, W) for s, C, T, p in jobs)
+        for sys_data, T, out_dir in all_work:
+            print(f"[BUILDER] Processing system: {sys_data.name}")
+            Cslice = sys_data.C_by_k[self.k_index]
+            self._process_and_save(sys_data, Cslice, T, out_dir, W)
+            
         print("[BUILDER] All true Bloch state .npz files have been generated.")
 
     def _process_and_save(self, sys_data, Cslice, T, out_dir, W):
+        # Parallelize at the individual band level as per original parallel logic 
         B_native = self.form_B_for_slice(sys_data.ae, Cslice)
         B_lifted = self.lift_B(B_native, T)
         psi, norms = self.fuse_true_bloch_rr(Cslice, B_lifted, W)
@@ -84,9 +88,16 @@ class TrueBlochStateBuilder:
 
     def load_system(self, directory, name):
         sys = SystemData(name, directory)
-        sys.ps = vaspwfc(os.path.join(directory, "WAVECAR")); sys.nspins = sys.ps._nspin
-        rows = [np.asarray(sys.ps.readBandCoeff(ispin=1, ikpt=self.k_index, iband=i, norm=False), dtype=np.complex128) for i in range(1, sys.ps._nbands + 1)]
+        sys.ps = vaspwfc(os.path.join(directory, "WAVECAR"))
+        sys.nspins = sys.ps._nspin
+        
+        # Explicit vertical stacking to preserve coefficient array dimensionality 
+        rows = []
+        for i in range(1, sys.ps._nbands + 1):
+            coeff = sys.ps.readBandCoeff(ispin=1, ikpt=self.k_index, iband=i, norm=False)
+            rows.append(np.asarray(coeff, dtype=np.complex128))
         sys.C_by_k[self.k_index] = np.vstack(rows)
+        
         sys.atoms = ase_read(os.path.join(directory, "POSCAR"))
         sys.ae = vasp_ae_wfc(sys.ps, poscar=os.path.join(directory, "POSCAR"), potcar=os.path.join(directory, "POTCAR"))
         sys.ch_per_atom = [sys.ae._pawpp[it].lmmax for it in sys.ae._element_idx]
@@ -142,20 +153,26 @@ class TrueBlochStateBuilder:
         Qm = Q.toarray() if issparse(Q) else np.asarray(Q)
         Qm = 0.5 * (Qm + Qm.conj().T)
         w, U = np.linalg.eigh(Qm)
-        if tol is None: tol = max(1e-10, 1e-8 * float(w.max() if w.size else 1.0))
+        if tol is None: 
+            tol = max(1e-10, 1e-8 * float(w.max() if w.size else 1.0)) # [cite: 23]
         keep = (w > tol)
-        if not np.any(keep): raise ValueError("Q matrix is not positive definite; cannot build whitener.")
-        W = U[:, keep] * (1.0 / np.sqrt(w[keep]))[None, :]
+        if not np.any(keep): 
+            raise ValueError("Q matrix is not positive definite; cannot build whitener.")
+        # Restoration of original square root scaling [cite: 22]
+        W = U[:, keep] * np.sqrt(w[keep])[None, :] 
         return W, {"rank": int(keep.sum())}
 
     @staticmethod
     def form_B_for_slice(ae, Cslice):
-        def build_vec(coeff_row): return np.asarray(ae.get_beta_njk(coeff_row), dtype=np.complex128)
+        def build_vec(coeff_row): 
+            return np.asarray(ae.get_beta_njk(coeff_row), dtype=np.complex128)
+        # Re-introducing fine-grained parallelization for band construction [cite: 21]
         B_rows = Parallel(n_jobs=-1, prefer="threads")(delayed(build_vec)(Cslice[ib, :]) for ib in range(Cslice.shape[0]))
         return np.ascontiguousarray(B_rows)
 
     @staticmethod
-    def lift_B(B_comp, T): return B_comp @ T.conj().T
+    def lift_B(B_comp, T): 
+        return B_comp @ T.conj().T
 
     @staticmethod
     def fuse_true_bloch_rr(C, B, W):
