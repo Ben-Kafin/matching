@@ -150,7 +150,6 @@ class RectangularTrueBlochMatcher:
         print(f"\n[ALIGN] Aligning Vacuum Levels (Ref: Metal) & Setting Global Zero (Ref: {zero_reference})...")
         
         # A. Get Anchors (Metal Vacuum & Reference Fermi)
-        # Always align vacuums to metal first to establish physical frame
         v_vac_metal, cached_m = self.get_vacuum_potential(self.metal_dir, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
         
         # Calculate the Global Shift required to zero the requested reference
@@ -158,11 +157,7 @@ class RectangularTrueBlochMatcher:
         v_vac_ref, _ = self.get_vacuum_potential(ref_path, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
         e_fermi_ref_raw = self.read_fermi_from_doscar(ref_path)
         
-        # Logic: 
-        # 1. Align Ref to Metal Vacuum:  E_ref_vac_aligned = E_ref_raw + (V_vac_metal - V_vac_ref)
-        # 2. We want E_ref_vac_aligned @ Fermi + global_shift = 0.0
-        # 3. Thus: global_shift = -(E_ref_raw + V_vac_metal - V_vac_ref)
-        
+        # Logic for alignment
         global_shift = -(e_fermi_ref_raw + (v_vac_metal - v_vac_ref))
         print(f"  [ALIGN] Global Shift calculated: {global_shift:+.4f} eV (Ensures {zero_reference} E_f -> 0.0 eV)")
 
@@ -173,14 +168,12 @@ class RectangularTrueBlochMatcher:
         e_f_metal_raw = self.read_fermi_from_doscar(self.metal_dir)
         e_raw_metal = self.read_gamma_energies_from_eigenval(self.metal_dir)
         
-        # Shift = (Vac_Metal - Vac_Metal) + global_shift = global_shift
         shift_metal = global_shift 
         e_m_full = e_raw_metal + shift_metal
         final_fermis["metal"] = e_f_metal_raw + shift_metal
         
-        occ_m = np.where(e_raw_metal[0] < e_f_metal_raw)[0]
-        homo_idx_m = occ_m[-1] + 1 if occ_m.size > 0 else 0
-        homo_indices["metal"] = homo_idx_m
+        # NEW: Proximity-based HOMO detection
+        homo_indices["metal"] = np.argmin(np.abs(e_raw_metal[0] - e_f_metal_raw)) + 1
         print(f"  [METAL] V_vac={v_vac_metal:.4f} | Shift={shift_metal:+.4f} eV | Final Fermi={final_fermis['metal']:+.4f} eV")
 
         # C. Apply to Full System
@@ -202,9 +195,8 @@ class RectangularTrueBlochMatcher:
             e_f_mol_raw = self.read_fermi_from_doscar(md)
             e_raw_mol = self.read_gamma_energies_from_eigenval(md)
             
-            occ_mol = np.where(e_raw_mol[0] < e_f_mol_raw)[0]
-            homo_idx_mol = occ_mol[-1] + 1 if occ_mol.size > 0 else 0
-            homo_indices[label] = homo_idx_mol 
+            # NEW: Proximity-based HOMO detection
+            homo_indices[label] = np.argmin(np.abs(e_raw_mol[0] - e_f_mol_raw)) + 1
             
             shift_mol = (v_vac_metal - v_vac_mol) + global_shift
             e_ms_full.append(e_raw_mol + shift_mol)
@@ -271,9 +263,16 @@ class RectangularTrueBlochMatcher:
         with open(main_out, "w") as f:
             homo_str = "; ".join([f"{k}={v}" for k, v in homo_indices.items()])
             fermi_str = "; ".join([f"{k}={v:.5f}" for k, v in final_fermis.items()])
+            
+            # NEW: Calculate single aligned vacuum potential value
+            v_aligned = v_vac_metal + global_shift
+            vacuum_str = f"aligned={v_aligned:.5f}"
+            
             f.write(f"# HOMOS: {homo_str}\n")
             f.write(f"# FERMIS: {fermi_str}\n")
+            f.write(f"# VACUUMS: {vacuum_str}\n") # New header line
             f.write("# full_idx E_full " + " ".join([f"| {lbl}_idx {lbl}_E {lbl}_dE {lbl}_ov_best {lbl}_w_span" for lbl in comp_labels]) + " | residual\n")
+            
             for r in sorted(rows, key=lambda x: x['full_idx']):
                 f.write(f"{r['full_idx']:<8d} {r['E_full']:.4f} " + " ".join([f"| {b['idx']:<7d} {b['E']:.4f} {b['dE']:.4f} {b['ov_best']:.5f} {b['w_span']:.5f}" for b in [r[lbl] for lbl in comp_labels]]) + f" | {r['residual']:.5f}\n")
         
@@ -301,13 +300,13 @@ if __name__ == "__main__":
         "tol_map": 1e-3, 
         "check_species": True,
         "band_window_molecules": [slice(0, 42)],
-        "reuse_cached": False,       
+        "reuse_cached": True,       
         "reuse_vac_cache": True,    
         "curvature_tol": 5e-8, 
         "dipole_threshold": 0.15,
         
         # === CHOOSE YOUR ZERO HERE ===
-        "zero_reference": "metal" # Options: "metal", "full", "NHC_left" (or your molecule folder name)
+        "zero_reference": "full" # Options: "metal", "full", "NHC_left" (or your molecule folder name)
     }
     
     match_files = run_match(
@@ -324,27 +323,30 @@ if __name__ == "__main__":
         cfg = PlotConfig(
             cmap_name_simple="managua_r", 
             cmap_name_metal="vanimo_r",
-            energy_range=(-20.0, 7.25), 
+            energy_range=(-9.5, 5), 
             shared_molecule_color=False,
-            min_total_mol_wspan=0.025, # Adjusted threshold for metal vs molecule
+            min_total_mol_wspan=0.025,
             
-            # === NEW COLORING PARAMETERS ===
-            # Power-law warping for higher contrast near Fermi level
+            # NEW COLORING PARAMETERS
             power_simple_neg=0.25,
             power_simple_pos=0.75,
             power_metal_neg=0.075,
             power_metal_pos=0.075,
             
-            # === CHOOSE YOUR COLORING MODE ===
-            # Options: "blended" (weighted mix), True (Winner-takes-all), False (Segmented)
+            # COLORING MODE
             pick_primary=False, 
             
-            # === FERMI VISUALS ===
-            show_local_fermi=True, # Shows the red dashed lines for individual systems
+            # FERMI VISUALS
+            show_local_fermi=True,
+            
+            # NEW: VACUUM VISUALS
+            show_vacuum_line=True,      # Enable the black line
+            vacuum_line_color="black",
+            vacuum_line_width=2,      # Thick line as requested
+            vacuum_line_style="-"
         )
         
         plotter = RectAEPAWColorPlotter(cfg)
-        # The 'bonding' flag controls tooltip behavior and zero-cross clamping
         fig, axes = plotter.plot(main_match_file, bonding=True) 
         plt.show()
     except Exception as e:
