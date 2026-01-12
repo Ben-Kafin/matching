@@ -1,10 +1,5 @@
-# File: plotter_layered_vacupot.py
+# File: vacupot_plotter.py
 # -*- coding: utf-8 -*-
-"""
-Final, patched plotter. 
-Integrated advanced rank-pivot coloring and three-way pick_primary modes from plotter.py.
-Retained local Fermi plotting, metadata parsing, and layered sorting from vacupot.
-"""
 from __future__ import annotations
 import os
 from collections import defaultdict
@@ -25,10 +20,11 @@ from classifier import StateBehaviorClassifier
 
 def _read_rect_txt_delimited(path: str) -> Dict[str, Any]:
     """
-    Parses matcher output. Retains metadata support for HOMOS and FERMIS.
+    Parses matcher output. Retains metadata support for HOMOS, FERMIS, and VACUUMS.
     """
     rows: List[Dict[str, Any]] = []
-    meta: Dict[str, Any] = {"homos": {}, "fermis": {}}
+    # Updated to include 'vacuums' in meta dictionary
+    meta: Dict[str, Any] = {"homos": {}, "fermis": {}, "vacuums": {}}
     
     if not os.path.isfile(path):
         return {"rows": [], "meta": meta}
@@ -52,6 +48,14 @@ def _read_rect_txt_delimited(path: str) -> Dict[str, Any]:
                 if "=" in p:
                     k, v = p.split("=")
                     try: meta["fermis"][k.strip()] = float(v.strip())
+                    except ValueError: pass
+        # Patched to parse the single aligned vacuum potential
+        elif s.startswith("# VACUUMS:"):
+            parts = s.replace("# VACUUMS:", "").strip().split(";")
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=")
+                    try: meta["vacuums"][k.strip()] = float(v.strip())
                     except ValueError: pass
         elif s.startswith("# full_idx") or s.startswith("#full_idx"):
             header_line = s
@@ -117,7 +121,6 @@ def _read_ov_all(path: str) -> Tuple[Dict[int, Dict[str, List[Dict[str, float]]]
 class PlotConfig:
     cmap_name_simple: str = "managua_r"
     cmap_name_metal: str = "vanimo_r"
-    # Adopting rank-pivot power warping from plotter.py
     power_simple_neg: float = 0.25
     power_simple_pos: float = 0.75
     power_metal_neg: float = 0.075
@@ -134,13 +137,18 @@ class PlotConfig:
     show_local_fermi: bool = True
     local_fermi_style: str = "--"
     local_fermi_color: str = "red"
+
+    # Vacuum Potential Visuals
+    show_vacuum_line: bool = True
+    vacuum_line_color: str = "black"
+    vacuum_line_width: float = 3.5  # Thick line as requested
+    vacuum_line_style: str = "-"
     
     annotate_on_hover: bool = True
     interactive: bool = True
     shared_molecule_color: bool = False
     energy_range: Optional[Tuple[float, float]] = None
     title_full: str = "Full system"
-    # Support for True, False, and "blended"
     pick_primary: Any = "blended" 
     min_total_mol_wspan: float = 0.025
 
@@ -161,9 +169,6 @@ class RectAEPAWColorPlotter:
 
     def _build_colors_rank_pivot(self, pairs: List[Tuple[int, float]], cmap_name: str,
                                  center_idx: Optional[int], power_neg: float, power_pos: float) -> Dict[int, Tuple]:
-        """
-        Rank-based colormap assignment with power-law warping.
-        """
         if not pairs: return {}
         ordered = sorted(pairs, key=lambda t: t[1])
         idxs = [idx for idx, _ in ordered]
@@ -180,9 +185,6 @@ class RectAEPAWColorPlotter:
         return colors
 
     def _mix_component_color(self, recs: List[Dict[str, float]], base_colors: Dict[int, Any], default=(0.4, 0.4, 0.4, 1.0)):
-        """
-        Weighted RGB average for metal background.
-        """
         if not recs: return default
         num = np.zeros(3); denom = 0.0
         for r in recs:
@@ -201,6 +203,10 @@ class RectAEPAWColorPlotter:
         rows, meta = data["rows"], data["meta"]
         known_homos, known_fermis = meta.get("homos", {}), meta.get("fermis", {})
         
+        # Retrieve the single aligned vacuum value from metadata
+        known_vacuums = meta.get("vacuums", {})
+        v_aligned = known_vacuums.get("aligned")
+        
         ov_all_path = os.path.join(os.path.dirname(path), "band_matches_rectangular_all.txt")
         by_full, comp_pairs = _read_ov_all(ov_all_path) if os.path.isfile(ov_all_path) else ({}, {})
 
@@ -215,7 +221,6 @@ class RectAEPAWColorPlotter:
         
         component_colors: Dict[str, Dict[int, Tuple]] = {}
         
-        # Color Centering: Metadata priority with energetic fallback
         def get_center_idx(lbl, pairs):
             if lbl in known_homos: return int(known_homos[lbl])
             occupied = [(idx, E) for idx, E in pairs if E <= 0]
@@ -254,6 +259,11 @@ class RectAEPAWColorPlotter:
             if self.cfg.show_local_fermi and local_E_f is not None:
                 axc.axvline(local_E_f, color=self.cfg.local_fermi_color, linestyle=self.cfg.local_fermi_style, alpha=0.9)
             
+            # Draw the thick black vacuum potential line on component subplots
+            if self.cfg.show_vacuum_line and v_aligned is not None:
+                axc.axvline(v_aligned, color=self.cfg.vacuum_line_color, linewidth=self.cfg.vacuum_line_width, 
+                            linestyle=self.cfg.vacuum_line_style, zorder=5)
+
             pairs, colors_map, class_map = comp_pairs.get(comp_label, []), component_colors.get(comp_label, {}), component_class_maps.get(comp_label, {})
             artists, hover_map = self._artists_by_comp.setdefault(comp_label, []), self._hover_map_comp.setdefault(comp_label, {})
             artists.clear(); hover_map.clear()
@@ -275,10 +285,15 @@ class RectAEPAWColorPlotter:
                 def _on_add_comp(sel, hmap=hover_map):
                     if (txt := hmap.get(sel.artist)): sel.annotation.set_text(txt)
         
-        # --- Full System Plot with Selection Modes ---
+        # --- Full System Plot ---
         if self.cfg.show_fermi_line: ax_f.axvline(0.0, color=self.cfg.fermi_line_color, linestyle=self.cfg.fermi_line_style, alpha=0.7)
         if self.cfg.show_local_fermi and (lf_full := known_fermis.get("full")) is not None:
              ax_f.axvline(lf_full, color=self.cfg.local_fermi_color, linestyle=self.cfg.local_fermi_style, alpha=0.9)
+
+        # Draw the thick black vacuum potential line on full system plot
+        if self.cfg.show_vacuum_line and v_aligned is not None:
+            ax_f.axvline(v_aligned, color=self.cfg.vacuum_line_color, linewidth=self.cfg.vacuum_line_width, 
+                         linestyle=self.cfg.vacuum_line_style, zorder=5)
 
         metal_states_to_plot, molecule_states_to_plot = [], []
 
@@ -293,7 +308,6 @@ class RectAEPAWColorPlotter:
                           for lbl in comp_iter_order if (top := rec.get(lbl))]
             hover_text = f"full_idx {full_idx}\nE_full {E_full:+.3f}\n" + "\n".join(comp_lines) + f"\nresidual {rec.get('residual',0.0):.5f}"
 
-            # 1. Winner-Takes-All
             if self.cfg.pick_primary is True:
                 winner_lbl = max(all_wspans, key=all_wspans.get)
                 color = def_metal_col
@@ -303,7 +317,6 @@ class RectAEPAWColorPlotter:
                 abs_dE = abs(rec.get(winner_lbl, {}).get("dE", 0.0))
                 (molecule_states_to_plot if winner_lbl != "metal" else metal_states_to_plot).append((abs_dE, E_full, color, hover_text, 'single'))
             
-            # 2. Weighted Global Average
             elif self.cfg.pick_primary == "blended":
                 final_rgb, total_ov_sum = np.zeros(3), 0.0
                 for lbl in comp_iter_order:
@@ -317,7 +330,6 @@ class RectAEPAWColorPlotter:
                 abs_dE = abs(rec.get("metal", {}).get("dE", 0.0))
                 (molecule_states_to_plot if total_mol_wspan >= self.cfg.min_total_mol_wspan else metal_states_to_plot).append((abs_dE, E_full, blend_col, hover_text, 'single'))
 
-            # 3. Segmented / Stacked
             else:
                 abs_dE = abs(rec.get("metal", {}).get("dE", 0.0))
                 if total_mol_wspan >= self.cfg.min_total_mol_wspan:
@@ -337,7 +349,6 @@ class RectAEPAWColorPlotter:
                 else:
                     metal_states_to_plot.append((abs_dE, E_full, def_metal_col, hover_text, 'single'))
 
-        # Final Sorted Rendering
         metal_states_to_plot.sort(key=lambda x: x[0]); molecule_states_to_plot.sort(key=lambda x: x[0])
         self._artists_f.clear(); self._hover_map_f.clear()
         for abs_dE, E_full, plot_data, hover_text, plot_type in metal_states_to_plot + molecule_states_to_plot:
