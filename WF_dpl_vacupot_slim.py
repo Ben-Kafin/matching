@@ -263,7 +263,7 @@ def calculate_work_function(locpot, ef, curvature_tol=5e-8, dipole_threshold=0.1
 if __name__ == "__main__":
     # 1. Define the directory containing your VASP output files
     # Note: Use the directory path rather than the specific file path for the Fermi search
-    target_dir = r'C:/Users/Benjamin Kafin/Documents/VASP/lone/NHC2Au/adatom_surface/dpl/kp551'
+    target_dir = r'C:/dir'
     locpot_path = os.path.join(target_dir, 'LOCPOT')
     
     if os.path.exists(locpot_path):
@@ -278,4 +278,5 @@ if __name__ == "__main__":
         # No changes needed to this function call
         calculate_work_function(locpot, ef, dipole_threshold=0.15, min_width=10, plot=True, verbose=True)
     else:
+
         print(f"File not found: {locpot_path}")
