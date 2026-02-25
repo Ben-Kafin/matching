@@ -17,7 +17,7 @@ from vacupot_plotter import RectAEPAWColorPlotter, PlotConfig
 from classifier import StateBehaviorClassifier 
 
 # IMPORT THE VACUUM LOGIC
-from WF_dpl_vacupot import calculate_work_function
+from WF_dpl_vacupot_slim import calculate_work_function
 
 class RectangularTrueBlochMatcher:
     """
@@ -44,10 +44,6 @@ class RectangularTrueBlochMatcher:
             bw_mols_input.extend([bw_mols_input[-1]] * diff)
             
         self.band_windows = {lbl: bw_mols_input[i] for i, lbl in enumerate(self.mol_labels)}
-        self.band_windows.update({
-            "metal": kwargs.get("band_window_metal"), 
-            "full": kwargs.get("band_window_full")
-        })
 
     @staticmethod
     def get_vacuum_potential(directory: str, curvature_tol=5e-8, dipole_threshold=0.15, min_width=10, reuse_cache=True) -> Tuple[float, bool]:
@@ -104,9 +100,44 @@ class RectangularTrueBlochMatcher:
         return np.load(path)["psi"]
 
     @staticmethod
-    def read_fermi_from_doscar(directory: str):
-        with open(os.path.join(directory, "DOSCAR"), "r") as f:
-            return float(f.readlines()[5].split()[3])
+    def get_fermi_energy(directory):
+        """
+        Retrieves the Fermi energy and returns it as 'ef'.
+        Searches DOSCAR first, then falls back to OUTCAR.
+        """
+        doscar_path = os.path.join(directory, "DOSCAR")
+        outcar_path = os.path.join(directory, "OUTCAR")
+        ef = None
+        # 1. Attempt to parse DOSCAR (Line 6, Index 3)
+        if os.path.exists(doscar_path):
+            try:
+                with open(doscar_path, "r") as f:
+                    lines = f.readlines()
+                    if len(lines) > 5:
+                        # Extracts the float at index 3 of the 6th line
+                        ef = float(lines[5].split()[3])
+                        return ef
+            except (ValueError, IndexError):
+                pass
+        # 2. Fallback to OUTCAR search
+        if os.path.exists(outcar_path):
+            try:
+                with open(outcar_path, "r") as f:
+                    for line in f:
+                        # Matches your specific string: "Fermi energy: -2.234..."
+                        if "Fermi energy:" in line:
+                            # Taking the last element captures the signed numerical value
+                            ef = float(line.split()[-1])
+                # Returns the final converged value found in the file
+                if ef is not None:
+                    return ef
+            except Exception as e:
+                print(f"Error reading OUTCAR: {e}")
+        # Default fallback if both files fail
+        if ef is None:
+            print(f"Warning: Could not find Fermi Energy in {directory}. Using 0.0")
+            ef = 0.0
+        return ef
 
     @staticmethod
     def read_gamma_energies_from_eigenval(directory: str):
@@ -155,7 +186,7 @@ class RectangularTrueBlochMatcher:
         # Calculate the Global Shift required to zero the requested reference
         ref_path = dir_map[zero_reference]
         v_vac_ref, _ = self.get_vacuum_potential(ref_path, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
-        e_fermi_ref_raw = self.read_fermi_from_doscar(ref_path)
+        e_fermi_ref_raw = self.get_fermi_energy(ref_path)
         
         # Logic for alignment
         global_shift = -(e_fermi_ref_raw + (v_vac_metal - v_vac_ref))
@@ -165,7 +196,7 @@ class RectangularTrueBlochMatcher:
         homo_indices = {}
 
         # B. Apply to Metal
-        e_f_metal_raw = self.read_fermi_from_doscar(self.metal_dir)
+        e_f_metal_raw = self.get_fermi_energy(self.metal_dir)
         e_raw_metal = self.read_gamma_energies_from_eigenval(self.metal_dir)
         
         shift_metal = global_shift 
@@ -178,10 +209,11 @@ class RectangularTrueBlochMatcher:
 
         # C. Apply to Full System
         v_vac_full, cached_f = self.get_vacuum_potential(self.full_dir, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
-        e_f_full_raw = self.read_fermi_from_doscar(self.full_dir)
+        e_f_full_raw = self.get_fermi_energy(self.full_dir)
         
         shift_full = (v_vac_metal - v_vac_full) + global_shift
-        e_f_full = self.read_gamma_energies_from_eigenval(self.full_dir) + shift_full
+        e_raw_full = self.read_gamma_energies_from_eigenval(self.full_dir)
+        e_f_full = e_raw_full + shift_full
         final_fermis["full"] = e_f_full_raw + shift_full
         print(f"  [FULL]  V_vac={v_vac_full:.4f} | Shift={shift_full:+.4f} eV | Final Fermi={final_fermis['full']:+.4f} eV")
 
@@ -192,7 +224,7 @@ class RectangularTrueBlochMatcher:
             label = self.mol_labels[i]
             v_vac_mol, cached_mol = self.get_vacuum_potential(md, self.curv_tol, self.dipole_threshold, reuse_cache=reuse_vac_cache)
 
-            e_f_mol_raw = self.read_fermi_from_doscar(md)
+            e_f_mol_raw = self.get_fermi_energy(md)
             e_raw_mol = self.read_gamma_energies_from_eigenval(md)
             
             # NEW: Proximity-based HOMO detection
@@ -207,13 +239,13 @@ class RectangularTrueBlochMatcher:
         print("[ALIGN] Alignment complete.\n")
 
         # 3. Slicing
-        bw_f = self.band_windows.get("full")
-        psi_f = psi_arrays_full["full"][bw_f, :] if bw_f else psi_arrays_full["full"]
-        e_f = e_f_full[:, bw_f] if bw_f else e_f_full
+        bw_f = np.where(e_raw_full[0] < v_vac_full)[0]
+        psi_f = psi_arrays_full["full"][bw_f, :]
+        e_f = e_f_full[:, bw_f]
 
-        bw_m = self.band_windows.get("metal")
-        psi_m = psi_arrays_full["metal"][bw_m, :] if bw_m else psi_arrays_full["metal"]
-        e_m = e_m_full[:, bw_m] if bw_m else e_m_full
+        bw_m = np.where(e_raw_metal[0] < v_vac_metal)[0]
+        psi_m = psi_arrays_full["metal"][bw_m, :]
+        e_m = e_m_full[:, bw_m]
 
         psi_molecules, e_ms = [], []
         for i, lbl in enumerate(self.mol_labels):
@@ -310,9 +342,9 @@ if __name__ == "__main__":
     }
     
     match_files = run_match(
-        molecule_dirs=[r'dir'],
-        metal_dir=r'dir',
-        full_dir=r'dir',
+        molecule_dirs=[r'C:/dir'],
+        metal_dir=r'C:/dir',
+        full_dir=r'C:/dir',
         **run_kwargs
     )
     main_match_file = match_files[0]
@@ -323,9 +355,9 @@ if __name__ == "__main__":
         cfg = PlotConfig(
             cmap_name_simple="managua_r", 
             cmap_name_metal="vanimo_r",
-            energy_range=(-9.5, 5), 
-            shared_molecule_color=False,
-            min_total_mol_wspan=0.025,
+            energy_range=(-11, 6), 
+            shared_molecule_color=True,
+            min_total_mol_wspan=0.03,
             
             # NEW COLORING PARAMETERS
             power_simple_neg=0.25,
