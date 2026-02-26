@@ -1,5 +1,11 @@
-# File: vacupot_plotter.py
 # -*- coding: utf-8 -*-
+"""
+Created on Wed Feb 25 16:01:01 2026
+
+@author: Benjamin Kafin
+"""
+
+# File: vacupot_plotter.py
 from __future__ import annotations
 import os
 from collections import defaultdict
@@ -23,7 +29,6 @@ def _read_rect_txt_delimited(path: str) -> Dict[str, Any]:
     Parses matcher output. Retains metadata support for HOMOS, FERMIS, and VACUUMS.
     """
     rows: List[Dict[str, Any]] = []
-    # Updated to include 'vacuums' in meta dictionary
     meta: Dict[str, Any] = {"homos": {}, "fermis": {}, "vacuums": {}}
     
     if not os.path.isfile(path):
@@ -49,7 +54,6 @@ def _read_rect_txt_delimited(path: str) -> Dict[str, Any]:
                     k, v = p.split("=")
                     try: meta["fermis"][k.strip()] = float(v.strip())
                     except ValueError: pass
-        # Patched to parse the single aligned vacuum potential
         elif s.startswith("# VACUUMS:"):
             parts = s.replace("# VACUUMS:", "").strip().split(";")
             for p in parts:
@@ -125,12 +129,12 @@ class PlotConfig:
     power_simple_pos: float = 0.75
     power_metal_neg: float = 0.075
     power_metal_pos: float = 0.075
+    power_residual: float = 2.0
     figsize: Tuple[float, float] = (8.0, 3.0)
     lw_stick: float = 2.0
     xlabel: str = "Energy (eV)"
     ylabel: str = "Normalized"
     
-    # Global/Local Fermi Visuals
     show_fermi_line: bool = True
     fermi_line_style: str = ":"
     fermi_line_color: str = "k"
@@ -138,10 +142,9 @@ class PlotConfig:
     local_fermi_style: str = "--"
     local_fermi_color: str = "red"
 
-    # Vacuum Potential Visuals
     show_vacuum_line: bool = True
     vacuum_line_color: str = "black"
-    vacuum_line_width: float = 3.5  # Thick line as requested
+    vacuum_line_width: float = 3.5 
     vacuum_line_style: str = "-"
     
     annotate_on_hover: bool = True
@@ -202,8 +205,6 @@ class RectAEPAWColorPlotter:
         data = self.load(path)
         rows, meta = data["rows"], data["meta"]
         known_homos, known_fermis = meta.get("homos", {}), meta.get("fermis", {})
-        
-        # Retrieve the single aligned vacuum value from metadata
         known_vacuums = meta.get("vacuums", {})
         v_aligned = known_vacuums.get("aligned")
         
@@ -255,15 +256,7 @@ class RectAEPAWColorPlotter:
         for i, comp_label in enumerate(comp_iter_order):
             axc = comp_axes[i]
             if self.cfg.show_fermi_line: axc.axvline(0.0, color=self.cfg.fermi_line_color, linestyle=self.cfg.fermi_line_style, alpha=0.7)
-            local_E_f = known_fermis.get(comp_label)
-            if self.cfg.show_local_fermi and local_E_f is not None:
-                axc.axvline(local_E_f, color=self.cfg.local_fermi_color, linestyle=self.cfg.local_fermi_style, alpha=0.9)
             
-            # Draw the thick black vacuum potential line on component subplots
-            if self.cfg.show_vacuum_line and v_aligned is not None:
-                axc.axvline(v_aligned, color=self.cfg.vacuum_line_color, linewidth=self.cfg.vacuum_line_width, 
-                            linestyle=self.cfg.vacuum_line_style, zorder=5)
-
             pairs, colors_map, class_map = comp_pairs.get(comp_label, []), component_colors.get(comp_label, {}), component_class_maps.get(comp_label, {})
             artists, hover_map = self._artists_by_comp.setdefault(comp_label, []), self._hover_map_comp.setdefault(comp_label, {})
             artists.clear(); hover_map.clear()
@@ -278,6 +271,15 @@ class RectAEPAWColorPlotter:
                         f"down  E={info.get('E_minus',0):+.3f}, I={info.get('I_minus',0):.3f}\n"
                         f"mean shift {ms:+.3f} eV\n" f"variance   {var:.3f} eV^2")
                 hover_map[line] = f"{comp_label} band {comp_idx}, E {E:+.3f} eV\n{body}"
+
+            local_E_f = known_fermis.get(comp_label)
+            if self.cfg.show_local_fermi and local_E_f is not None:
+                axc.axvline(local_E_f, color=self.cfg.local_fermi_color, linestyle=self.cfg.local_fermi_style, alpha=0.9, zorder=10)
+            
+            if self.cfg.show_vacuum_line and v_aligned is not None:
+                axc.axvline(v_aligned, color=self.cfg.vacuum_line_color, linewidth=self.cfg.vacuum_line_width, 
+                            linestyle=self.cfg.vacuum_line_style, zorder=10)
+
             axc.set_ylabel(self.cfg.ylabel); axc.set_title(comp_label)
             if self.cfg.annotate_on_hover and HAS_MPLCURSORS and artists:
                 cur = mplcursors.cursor(artists, hover=True); self._cursor_by_comp[comp_label] = cur
@@ -286,36 +288,40 @@ class RectAEPAWColorPlotter:
                     if (txt := hmap.get(sel.artist)): sel.annotation.set_text(txt)
         
         # --- Full System Plot ---
-        if self.cfg.show_fermi_line: ax_f.axvline(0.0, color=self.cfg.fermi_line_color, linestyle=self.cfg.fermi_line_style, alpha=0.7)
-        if self.cfg.show_local_fermi and (lf_full := known_fermis.get("full")) is not None:
-             ax_f.axvline(lf_full, color=self.cfg.local_fermi_color, linestyle=self.cfg.local_fermi_style, alpha=0.9)
-
-        # Draw the thick black vacuum potential line on full system plot
-        if self.cfg.show_vacuum_line and v_aligned is not None:
-            ax_f.axvline(v_aligned, color=self.cfg.vacuum_line_color, linewidth=self.cfg.vacuum_line_width, 
-                         linestyle=self.cfg.vacuum_line_style, zorder=5)
-
-        metal_states_to_plot, molecule_states_to_plot = [], []
+        metal_segments_to_plot, molecule_segments_to_plot = [], []
+        RES_T = 0.05
+        C_GREY = np.array([0.8, 0.8, 0.8])
 
         for rec in rows:
             E_full, full_idx = float(rec["E_full"]), int(rec["full_idx"])
+            res = rec.get("residual", 0.0)
+            w_res = np.clip(((res - RES_T) / (1.0 - RES_T)) ** self.cfg.power_residual, 0.0, 1.0) if res > RES_T else 0.0
+            
             comps = by_full.get(full_idx, {})
             all_wspans = {lbl: rec.get(lbl, {}).get('w_span', 0.0) for lbl in comp_iter_order}
             total_mol_wspan = sum(w for lbl, w in all_wspans.items() if lbl != "metal")
-            def_metal_col = self._mix_component_color(comps.get("metal", []), component_colors.get("metal", {}))
-
+            
             comp_lines = [f"{lbl}: idx {int(top['idx'])}, E {top['E']:+.3f}, dE {top['dE']:+.3f}, ov {top['ov_best']:.4f}, w_span {top['w_span']:.4f}" 
                           for lbl in comp_iter_order if (top := rec.get(lbl))]
-            hover_text = f"full_idx {full_idx}\nE_full {E_full:+.3f}\n" + "\n".join(comp_lines) + f"\nresidual {rec.get('residual',0.0):.5f}"
+            hover_text = f"full_idx {full_idx}\nE_full {E_full:+.3f}\n" + "\n".join(comp_lines) + f"\nresidual {res:.5f}"
+
+            # Full weighted energy shift for the current E_full state across ALL components
+            pooled_recs = [r for lbl in comp_iter_order for r in comps.get(lbl, [])]
+            state_classification = classifier.classify_state(pooled_recs)
+            full_weighted_z_metric = abs(state_classification.get("mean_shift", 0.0))
 
             if self.cfg.pick_primary is True:
                 winner_lbl = max(all_wspans, key=all_wspans.get)
-                color = def_metal_col
-                if winner_lbl != "metal":
-                    if (w_idx := rec.get(winner_lbl, {}).get('idx')):
-                        color = component_colors.get(winner_lbl, {}).get(w_idx, "black")
-                abs_dE = abs(rec.get(winner_lbl, {}).get("dE", 0.0))
-                (molecule_states_to_plot if winner_lbl != "metal" else metal_states_to_plot).append((abs_dE, E_full, color, hover_text, 'single'))
+                w_info = rec.get(winner_lbl, {})
+                if winner_lbl == "metal":
+                    color = self._mix_component_color(comps.get("metal", []), component_colors.get("metal", {}))
+                    color = tuple((1.0 - w_res) * np.array(color[:3]) + w_res * C_GREY)
+                    metal_segments_to_plot.append((full_weighted_z_metric, E_full, 0.0, 1.0, color, hover_text))
+                else:
+                    z_metric = abs(w_info.get('dE', 0.0))
+                    color = component_colors.get(winner_lbl, {}).get(int(w_info['idx']), (0.4, 0.4, 0.4))
+                    color = tuple((1.0 - w_res) * np.array(color[:3]) + w_res * C_GREY)
+                    molecule_segments_to_plot.append((z_metric, E_full, 0.0, 1.0, color, hover_text))
             
             elif self.cfg.pick_primary == "blended":
                 final_rgb, total_ov_sum = np.zeros(3), 0.0
@@ -327,42 +333,73 @@ class RectAEPAWColorPlotter:
                             final_rgb += np.array(c[:3]) * ov
                             total_ov_sum += ov
                 blend_col = tuple(final_rgb / total_ov_sum) if total_ov_sum > 0 else (0.4, 0.4, 0.4)
-                abs_dE = abs(rec.get("metal", {}).get("dE", 0.0))
-                (molecule_states_to_plot if total_mol_wspan >= self.cfg.min_total_mol_wspan else metal_states_to_plot).append((abs_dE, E_full, blend_col, hover_text, 'single'))
+                blend_col = tuple((1.0 - w_res) * np.array(blend_col[:3]) + w_res * C_GREY)
+                
+                if total_mol_wspan >= self.cfg.min_total_mol_wspan:
+                    mol_dEs = [abs(rec[lbl]['dE']) for lbl in mol_labels if lbl in rec]
+                    z_metric = max(mol_dEs) if mol_dEs else 0.0
+                    molecule_segments_to_plot.append((z_metric, E_full, 0.0, 1.0, blend_col, hover_text))
+                else:
+                    metal_segments_to_plot.append((full_weighted_z_metric, E_full, 0.0, 1.0, blend_col, hover_text))
 
             else:
-                abs_dE = abs(rec.get("metal", {}).get("dE", 0.0))
-                if total_mol_wspan >= self.cfg.min_total_mol_wspan:
-                    mol_contribs = []
-                    for mol_lbl in mol_labels:
-                        if (m_recs := comps.get(mol_lbl)):
-                            top = max(m_recs, key=lambda r: r.get("ov", 0.0))
-                            if top.get("ov", 0.0) > 1e-6:
-                                mol_contribs.append({'ov': top['ov'], 'col': component_colors[mol_lbl].get(int(top['comp_idx']))})
-                    mol_contribs.sort(key=lambda x: x['ov'], reverse=True)
-                    segments = []
-                    if mol_contribs:
-                        h = 1.0 / len(mol_contribs)
-                        for i, contrib in enumerate(mol_contribs):
-                            segments.append((1.0 - (i+1)*h, 1.0 - i*h, contrib['col']))
-                    molecule_states_to_plot.append((abs_dE, E_full, segments, hover_text, 'multi'))
+                final_rgb, total_ov_sum = np.zeros(3), 0.0
+                for lbl in comp_iter_order:
+                    for r in comps.get(lbl, []):
+                        ov = r.get('ov', 0.0)
+                        if ov > 1e-8:
+                            c = component_colors.get(lbl, {}).get(int(r['comp_idx']), (0.4, 0.4, 0.4))
+                            final_rgb += np.array(c[:3]) * ov
+                            total_ov_sum += ov
+                global_blend_col = tuple(final_rgb / total_ov_sum) if total_ov_sum > 0 else (0.4, 0.4, 0.4)
+                global_blend_col = tuple((1.0 - w_res) * np.array(global_blend_col[:3]) + w_res * C_GREY)
+                
+                if total_mol_wspan < self.cfg.min_total_mol_wspan:
+                    metal_segments_to_plot.append((full_weighted_z_metric, E_full, 0.0, 1.0, global_blend_col, hover_text))
                 else:
-                    metal_states_to_plot.append((abs_dE, E_full, def_metal_col, hover_text, 'single'))
+                    h = 1.0 / len(mol_labels) if mol_labels else 1.0
+                    for i, mol_lbl in enumerate(mol_labels):
+                        y_bot, y_top = 1.0 - (i + 1) * h, 1.0 - i * h
+                        m_rec = rec.get(mol_lbl, {})
+                        if m_rec.get('w_span', 0.0) >= self.cfg.min_total_mol_wspan:
+                            m_recs = comps.get(mol_lbl, [])
+                            if m_recs:
+                                # Determine color-specific record for segment
+                                top_r = max(m_recs, key=lambda r: r.get("ov", 0.0))
+                                seg_col = component_colors[mol_lbl].get(int(top_r['comp_idx']), (0.4, 0.4, 0.4, 1.0))
+                                # Independent Z-metric based on absolute shift of matching state
+                                z_metric = abs(top_r.get('dE', 0.0))
+                            else:
+                                seg_col, z_metric = global_blend_col, full_weighted_z_metric
+                        else:
+                            seg_col, z_metric = global_blend_col, full_weighted_z_metric
+                        
+                        seg_col = tuple((1.0 - w_res) * np.array(seg_col[:3]) + w_res * C_GREY)
+                        molecule_segments_to_plot.append((z_metric, E_full, y_bot, y_top, seg_col, hover_text))
 
-        metal_states_to_plot.sort(key=lambda x: x[0]); molecule_states_to_plot.sort(key=lambda x: x[0])
+        # Sort independently by segment-specific absolute shift (Highest shifts drawn last/on top)
+        metal_segments_to_plot.sort(key=lambda x: x[0])
+        molecule_segments_to_plot.sort(key=lambda x: x[0])
+        
         self._artists_f.clear(); self._hover_map_f.clear()
-        for abs_dE, E_full, plot_data, hover_text, plot_type in metal_states_to_plot + molecule_states_to_plot:
-            if plot_type == 'single':
-                line = ax_f.vlines(E_full, 0, 1, color=plot_data, lw=self.cfg.lw_stick)
-                self._artists_f.append(line); self._hover_map_f[line] = hover_text
-            elif plot_type == 'multi':
-                if not plot_data:
-                    line = ax_f.vlines(E_full, 0, 1, color=def_metal_col, lw=self.cfg.lw_stick)
-                    self._artists_f.append(line); self._hover_map_f[line] = hover_text
-                else:
-                    for y_bot, y_top, col in plot_data:
-                        line = ax_f.vlines(E_full, y_bot, y_top, color=col, lw=self.cfg.lw_stick)
-                        self._artists_f.append(line); self._hover_map_f[line] = hover_text
+        
+        # Draw Tier 1: Metal/Blended states first
+        for _, E_full, y_bot, y_top, col, hover_text in metal_segments_to_plot:
+            line = ax_f.vlines(E_full, y_bot, y_top, color=col, lw=self.cfg.lw_stick)
+            self._artists_f.append(line); self._hover_map_f[line] = hover_text
+            
+        # Draw Tier 2: Molecule states second
+        for _, E_full, y_bot, y_top, col, hover_text in molecule_segments_to_plot:
+            line = ax_f.vlines(E_full, y_bot, y_top, color=col, lw=self.cfg.lw_stick)
+            self._artists_f.append(line); self._hover_map_f[line] = hover_text
+
+        if self.cfg.show_fermi_line: ax_f.axvline(0.0, color=self.cfg.fermi_line_color, linestyle=self.cfg.fermi_line_style, alpha=0.7)
+        if self.cfg.show_local_fermi and (lf_full := known_fermis.get("full")) is not None:
+             ax_f.axvline(lf_full, color=self.cfg.local_fermi_color, linestyle=self.cfg.local_fermi_style, alpha=0.9, zorder=10)
+
+        if self.cfg.show_vacuum_line and v_aligned is not None:
+            ax_f.axvline(v_aligned, color=self.cfg.vacuum_line_color, linewidth=self.cfg.vacuum_line_width, 
+                         linestyle=self.cfg.vacuum_line_style, zorder=10)
 
         ax_f.set_title(self.cfg.title_full); ax_f.set_ylabel(self.cfg.ylabel); ax_f.set_xlabel(self.cfg.xlabel)
         if self.cfg.energy_range: ax_f.set_xlim(self.cfg.energy_range)
